@@ -4,6 +4,7 @@
 #define UNICODE
 #define _UNICODE
 #include <windows.h>
+#include <tlhelp32.h>
 #include <commctrl.h>
 #include <commdlg.h>
 #include <shellapi.h>
@@ -356,6 +357,8 @@ static void do_apply(const std::wstring&cache_path,const std::map<std::string,st
         bool written=false;
         for(int i=0;i<20&&!written;i++){written=fwrite_all(cache_path,patched);if(!written)Sleep(50);}
         if(!written){ui_status(L"Impossible d'écrire le BSP (GMod le tient?)",RGB(200,0,0));return;}
+        // Sauvegarder une copie du BSP modifié pour restaurer au prochain lancement
+        CopyFileW(cache_path.c_str(),(SAVE_DIR+L"\\__bsp_backup.bsp").c_str(),FALSE);
         lock_bsp(cache_path);
         PostMessageW(g_hwnd,WM_UPDLOCK,0,0);
         PostMessageW(g_hwnd,WM_SETREADY,1,0); // prêt à restart
@@ -368,11 +371,49 @@ static void do_apply(const std::wstring&cache_path,const std::map<std::string,st
     }catch(...){ui_status(L"Erreur lors de l'application",RGB(200,0,0));}
 }
 
+// ── GMod process watcher ───────────────────────────────────────────────────────
+static DWORD find_gmod_pid(){
+    HANDLE snap=CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS,0);
+    if(snap==INVALID_HANDLE_VALUE)return 0;
+    PROCESSENTRY32W pe={sizeof(pe)};
+    DWORD pid=0;
+    if(Process32FirstW(snap,&pe))do{
+        if(_wcsicmp(pe.szExeFile,L"hl2.exe")==0){pid=pe.th32ProcessID;break;}
+    }while(Process32NextW(snap,&pe));
+    CloseHandle(snap);
+    return pid;
+}
+
+static void gmod_exit_watcher(){
+    bool was_running=false;
+    while(g_watching){
+        bool running=(find_gmod_pid()!=0);
+        if(was_running&&!running&&g_watching){
+            // GMod vient de fermer → relâcher le verrou pour le prochain lancement
+            unlock_bsp();
+            std::wstring dest=CACHE_DIR+L"\\map_pack.bsp";
+            icacls(L"\""+dest+L"\" /remove:d Everyone");
+            SetFileAttributesW(dest.c_str(),FILE_ATTRIBUTE_NORMAL);
+            g_perm_pending=true; // prochain do_apply re-lockera
+        }
+        was_running=running;
+        Sleep(3000);
+    }
+}
+
 // ── Watch thread ───────────────────────────────────────────────────────────────
 static void watch_fn(){
     auto load_vtfs=[&](){return vtfs_from_save(g_active_save);};
-    // Appliquer la skybox au BSP existant immédiatement
+    // Si pas de BSP dans le cache, restaurer le backup de la session précédente
     auto p=find_cache_bsp();
+    if(p.empty()){
+        std::wstring bkp=SAVE_DIR+L"\\__bsp_backup.bsp";
+        std::wstring dest=CACHE_DIR+L"\\map_pack.bsp";
+        if(GetFileAttributesW(bkp.c_str())!=INVALID_FILE_ATTRIBUTES){
+            if(CopyFileW(bkp.c_str(),dest.c_str(),FALSE))p=dest;
+        }
+    }
+    // Appliquer la skybox au BSP trouvé (existant ou restauré)
     if(!p.empty()){
         auto vtfs=load_vtfs();
         if(!vtfs.empty()){
@@ -832,11 +873,13 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
                 icacls(L"\""+dest+L"\" /remove:d Everyone");
                 SetFileAttributesW(dest.c_str(),FILE_ATTRIBUTE_NORMAL);}
                 g_permanent=false;
-                g_perm_pending=true; // permanent activé automatiquement
-                PostMessageW(hw,WM_SETREADY,0,0); // en attente
+                g_perm_pending=true;
+                // "En attente" seulement si pas de BSP en cache — sinon le watcher va mettre vert immédiatement
+                if(find_cache_bsp().empty())PostMessageW(hw,WM_SETREADY,0,0);
                 g_watching=true;SetWindowTextW(g_btn_watch,L"STOP");
                 if(g_wthread.joinable()){g_watching=false;if(g_dir_handle!=INVALID_HANDLE_VALUE)CancelIoEx(g_dir_handle,nullptr);g_wthread.join();g_watching=true;}
                 g_wthread=std::thread(watch_fn);
+                std::thread(gmod_exit_watcher).detach();
                 ui_status(L"Actif — skybox sera appliquée automatiquement",RGB(0,100,200));
             } else {
                 // STOP : arrête le watcher + supprime le verrou
