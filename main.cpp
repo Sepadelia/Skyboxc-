@@ -53,7 +53,8 @@ enum {
 #define WM_SETSTATUS (WM_APP+1)
 #define WM_UPDLOCK   (WM_APP+2)
 
-#define WM_SETREADY (WM_APP+5)
+#define WM_SETREADY      (WM_APP+5)
+#define WM_FIRST_LAUNCH  (WM_APP+6)
 
 // ── Preview globals ────────────────────────────────────────────────────────────
 static HWND g_preview=nullptr;
@@ -737,7 +738,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
             {RECT r;GetWindowRect(g_hwnd,&r);
             int cx=(r.left+r.right)/2-165,cy=(r.top+r.bottom)/2-55;
             HWND dlg=CreateWindowW(L"SI2_CFG",L"Paramètres",
-                WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,cx,cy,330,110,hw,nullptr,GetModuleHandleW(nullptr),nullptr);
+                WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,cx,cy,330,155,hw,nullptr,GetModuleHandleW(nullptr),nullptr);
             ShowWindow(dlg,SW_SHOW);}
             break;
         }
@@ -1026,6 +1027,71 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     return DefWindowProcW(hw,msg,wp,lp);
 }
 
+// ── Fenêtre de setup premier lancement ────────────────────────────────────────
+static LRESULT CALLBACK SetupWndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
+    static HWND eDir=nullptr;
+    switch(msg){
+    case WM_CREATE:
+        CreateWindowW(L"STATIC",
+            L"Bienvenue ! Avant de commencer, indique où se trouve le dossier cache de GMod.\r\n\r\n"
+            L"Comment le trouver :\r\n"
+            L"  1. Ouvre Steam\r\n"
+            L"  2. Clic droit sur Garry's Mod  →  Gérer  →  Parcourir les fichiers locaux\r\n"
+            L"  3. Ouvre le dossier  garrysmod  puis  cache\r\n"
+            L"  4. Copie le chemin depuis la barre d'adresse de l'Explorateur\r\n"
+            L"  5. Colle-le dans le champ ci-dessous et clique Continuer",
+            WS_CHILD|WS_VISIBLE|SS_LEFT,12,12,450,162,hw,nullptr,nullptr,nullptr);
+        eDir=CreateWindowW(L"EDIT",CACHE_DIR.c_str(),
+            WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL,
+            12,182,408,22,hw,(HMENU)1,nullptr,nullptr);
+        CreateWindowW(L"BUTTON",L"...",WS_CHILD|WS_VISIBLE,424,182,30,22,hw,(HMENU)2,nullptr,nullptr);
+        CreateWindowW(L"BUTTON",L"Continuer →",WS_CHILD|WS_VISIBLE,12,216,120,28,hw,(HMENU)3,nullptr,nullptr);
+        break;
+    case WM_COMMAND:
+        if(LOWORD(wp)==2){
+            wchar_t buf[MAX_PATH]={};
+            BROWSEINFOW bi={};bi.hwndOwner=hw;bi.pszDisplayName=buf;
+            bi.lpszTitle=L"Sélectionne le dossier cache de GMod (garrysmod\\cache)";
+            bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST il=SHBrowseForFolderW(&bi);
+            if(il){wchar_t p[MAX_PATH]={};SHGetPathFromIDListW(il,p);CoTaskMemFree(il);SetWindowTextW(eDir,p);}
+        }
+        if(LOWORD(wp)==3){
+            wchar_t cdir[MAX_PATH]={};GetWindowTextW(eDir,cdir,MAX_PATH);
+            DWORD attr=GetFileAttributesW(cdir);
+            bool exists=(attr!=INVALID_FILE_ATTRIBUTES&&(attr&FILE_ATTRIBUTE_DIRECTORY));
+            std::wstring cd(cdir),cdl(cdir);
+            std::transform(cdl.begin(),cdl.end(),cdl.begin(),::towlower);
+            bool looks_ok=cdl.find(L"garrysmod\\cache")!=cdl.npos||cdl.find(L"garrysmod/cache")!=cdl.npos;
+            if(!exists||!looks_ok){
+                MessageBoxW(hw,
+                    L"Chemin invalide.\n\n"
+                    L"Le dossier doit exister et se terminer par :\\garrysmod\\cache\n\n"
+                    L"Exemple :\n"
+                    L"C:\\Program Files (x86)\\Steam\\steamapps\\common\\GarrysMod\\garrysmod\\cache",
+                    L"Erreur",MB_OK|MB_ICONERROR);
+                break;
+            }
+            CACHE_DIR=cd;
+            HKEY hk;
+            if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,nullptr,0,KEY_SET_VALUE,nullptr,&hk,nullptr)==ERROR_SUCCESS){
+                RegSetValueExW(hk,L"CacheDir",0,REG_SZ,(BYTE*)cdir,(DWORD)((wcslen(cdir)+1)*sizeof(wchar_t)));
+                RegCloseKey(hk);
+            }
+            PostQuitMessage(1);
+        }
+        break;
+    case WM_CLOSE:
+        // Forcer la configuration — pas de fermeture sans chemin valide
+        if(MessageBoxW(hw,L"Tu n'as pas configuré le dossier cache.\nQuitter l'application ?",
+            L"Skybox",MB_YESNO|MB_ICONQUESTION)==IDYES)
+            PostQuitMessage(0);
+        break;
+    default:return DefWindowProcW(hw,msg,wp,lp);
+    }
+    return 0;
+}
+
 // ── WinMain ────────────────────────────────────────────────────────────────────
 int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
     BOOL adm=FALSE;HANDLE tok;
@@ -1040,6 +1106,31 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
     }
     CoInitialize(nullptr);
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_WIN95_CLASSES};InitCommonControlsEx(&icc);
+    // ── Setup premier lancement ────────────────────────────────────────────────
+    {bool configured=false;
+    HKEY hk;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,KEY_READ,&hk)==ERROR_SUCCESS){
+        configured=RegQueryValueExW(hk,L"CacheDir",nullptr,nullptr,nullptr,nullptr)==ERROR_SUCCESS;
+        RegCloseKey(hk);
+    }
+    if(!configured){
+        WNDCLASSW wcs={};wcs.hInstance=hi;wcs.lpszClassName=L"SKYBOX_SETUP";
+        wcs.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);wcs.hCursor=LoadCursorW(nullptr,IDC_ARROW);
+        wcs.lpfnWndProc=SetupWndProc;RegisterClassW(&wcs);
+        HWND hs=CreateWindowW(L"SKYBOX_SETUP",L"Skybox — Configuration",
+            WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,480,295,nullptr,nullptr,hi,nullptr);
+        ShowWindow(hs,SW_SHOW);UpdateWindow(hs);
+        MSG ms;while(GetMessageW(&ms,nullptr,0,0)){TranslateMessage(&ms);DispatchMessageW(&ms);}
+        if(ms.wParam==0)return 0; // annulé
+    }}
+    // Charger le chemin cache sauvegardé
+    {HKEY hk;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,KEY_READ,&hk)==ERROR_SUCCESS){
+        wchar_t buf[MAX_PATH]={};DWORD sz=sizeof(buf);
+        if(RegQueryValueExW(hk,L"CacheDir",nullptr,nullptr,(BYTE*)buf,&sz)==ERROR_SUCCESS&&buf[0])
+            CACHE_DIR=buf;
+        RegCloseKey(hk);
+    }}
     // ── Classe panneau aperçu ──────────────────────────────────────────────────
     {WNDCLASSW wcp={};wcp.hInstance=hi;wcp.lpszClassName=L"PREVWND";
     wcp.lpfnWndProc=PreviewWndProc;wcp.hbrBackground=(HBRUSH)GetStockObject(BLACK_BRUSH);
@@ -1049,7 +1140,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
     wc2.hInstance=hi;wc2.lpszClassName=L"SI2_CFG";
     wc2.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);wc2.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     wc2.lpfnWndProc=[](HWND hw,UINT msg,WPARAM wp,LPARAM lp)->LRESULT{
-        static HWND chk=nullptr;
+        static HWND chk=nullptr,eCache=nullptr;
         switch(msg){
         case WM_CREATE:{
             HKEY hk;bool on=false;
@@ -1059,9 +1150,20 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
             }
             chk=CreateWindowW(L"BUTTON",L"Lancer au démarrage de Windows",WS_CHILD|WS_VISIBLE|BS_AUTOCHECKBOX,10,12,280,20,hw,(HMENU)1,nullptr,nullptr);
             SendMessageW(chk,BM_SETCHECK,on?BST_CHECKED:BST_UNCHECKED,0);
-            CreateWindowW(L"BUTTON",L"Enregistrer",WS_CHILD|WS_VISIBLE,10,42,100,26,hw,(HMENU)2,nullptr,nullptr);
+            CreateWindowW(L"STATIC",L"Dossier cache GMod :",WS_CHILD|WS_VISIBLE,10,42,200,18,hw,nullptr,nullptr,nullptr);
+            eCache=CreateWindowW(L"EDIT",CACHE_DIR.c_str(),WS_CHILD|WS_VISIBLE|WS_BORDER|ES_AUTOHSCROLL,10,60,270,20,hw,(HMENU)3,nullptr,nullptr);
+            CreateWindowW(L"BUTTON",L"...",WS_CHILD|WS_VISIBLE,284,60,30,20,hw,(HMENU)4,nullptr,nullptr);
+            CreateWindowW(L"BUTTON",L"Enregistrer",WS_CHILD|WS_VISIBLE,10,92,100,26,hw,(HMENU)2,nullptr,nullptr);
             break;}
         case WM_COMMAND:
+            if(LOWORD(wp)==4){
+                // Parcourir dossier cache
+                wchar_t buf[MAX_PATH]={};
+                BROWSEINFOW bi={};bi.hwndOwner=hw;bi.pszDisplayName=buf;
+                bi.lpszTitle=L"Sélectionne le dossier cache de GMod";bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
+                LPITEMIDLIST il=SHBrowseForFolderW(&bi);
+                if(il){wchar_t p[MAX_PATH]={};SHGetPathFromIDListW(il,p);CoTaskMemFree(il);SetWindowTextW(eCache,p);}
+            }
             if(LOWORD(wp)==2){
                 bool checked=SendMessageW(chk,BM_GETCHECK,0,0)==BST_CHECKED;
                 HKEY hk;
@@ -1073,6 +1175,27 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
                     RegDeleteValueW(hk,L"Skybox");
                 }
                 RegCloseKey(hk);
+                // Valider et sauvegarder le chemin cache
+                wchar_t cdir[MAX_PATH]={};GetWindowTextW(eCache,cdir,MAX_PATH);
+                if(cdir[0]){
+                    // Vérifier que le dossier existe
+                    DWORD attr=GetFileAttributesW(cdir);
+                    bool exists=(attr!=INVALID_FILE_ATTRIBUTES&&(attr&FILE_ATTRIBUTE_DIRECTORY));
+                    // Vérifier que le chemin contient garrysmod\cache
+                    std::wstring cd(cdir);
+                    std::wstring cdl=cd;std::transform(cdl.begin(),cdl.end(),cdl.begin(),::towlower);
+                    bool looks_ok=cdl.find(L"garrysmod\\cache")!=std::wstring::npos||cdl.find(L"garrysmod/cache")!=std::wstring::npos;
+                    if(!exists||!looks_ok){
+                        MessageBoxW(hw,L"Chemin invalide.\nLe dossier doit exister et se terminer par ...\\garrysmod\\cache",L"Erreur",MB_OK|MB_ICONERROR);
+                        break;
+                    }
+                    CACHE_DIR=cd;
+                    HKEY hk2;
+                    if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,nullptr,0,KEY_SET_VALUE,nullptr,&hk2,nullptr)==ERROR_SUCCESS){
+                        RegSetValueExW(hk2,L"CacheDir",0,REG_SZ,(BYTE*)cdir,(DWORD)((wcslen(cdir)+1)*sizeof(wchar_t)));
+                        RegCloseKey(hk2);
+                    }
+                }
                 DestroyWindow(hw);
             }
             break;
@@ -1082,6 +1205,14 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
         return 0;
     };
     RegisterClassW(&wc2);
+    // Charger le chemin cache sauvegardé
+    {HKEY hk;
+    if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,KEY_READ,&hk)==ERROR_SUCCESS){
+        wchar_t buf[MAX_PATH]={};DWORD sz=sizeof(buf);
+        if(RegQueryValueExW(hk,L"CacheDir",nullptr,nullptr,(BYTE*)buf,&sz)==ERROR_SUCCESS&&buf[0])
+            CACHE_DIR=buf;
+        RegCloseKey(hk);
+    }}
     // ── Fenêtre principale ─────────────────────────────────────────────────────
     WNDCLASSW wc={};
     wc.lpfnWndProc=WndProc;wc.hInstance=hi;wc.lpszClassName=L"SI2";
