@@ -62,6 +62,8 @@ enum {
 #define WM_SETREADY      (WM_APP+5)
 #define WM_FIRST_LAUNCH  (WM_APP+6)
 
+static bool g_start_hidden=false; // lancé depuis le démarrage Windows
+
 // ── Preview globals ────────────────────────────────────────────────────────────
 static HWND g_preview=nullptr;
 static std::vector<uint8_t> g_prev_bgra[6];
@@ -781,6 +783,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         show_purge_controls(false);
         show_launch_controls(true);
         refresh_saves();
+        PostMessageW(hw,WM_FIRST_LAUNCH,0,0);
         // Show créateur label for dir (hidden since Manuel mode)
         // Already handled: dir_edit, dir_browse, g_det[] are WS_CHILD (no WS_VISIBLE)
 
@@ -1036,6 +1039,14 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
                 auto sav=selected_save();
                 if(sav.empty()){ui_status(L"Sélectionne une sauvegarde",RGB(200,0,0));break;}
                 if(vtfs_from_save(sav).empty()){ui_status(L"Aucun VTF trouvé dans la sauvegarde",RGB(200,0,0));break;}
+                // Sauvegarder la dernière skybox utilisée
+                {int idx=(int)SendMessageW(g_list,LB_GETCURSEL,0,0);
+                wchar_t sname[MAX_PATH]={};SendMessageW(g_list,LB_GETTEXT,idx,(LPARAM)sname);
+                HKEY hk2;
+                if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,nullptr,0,KEY_SET_VALUE,nullptr,&hk2,nullptr)==ERROR_SUCCESS){
+                    RegSetValueExW(hk2,L"LastSkybox",0,REG_SZ,(BYTE*)sname,(DWORD)((wcslen(sname)+1)*sizeof(wchar_t)));
+                    RegCloseKey(hk2);
+                }}
                 g_active_save=sav;
                 // Nettoyer tout verrou résiduel (DENY peut rester si app fermée sans STOP)
                 {std::wstring dest=CACHE_DIR+L"\\map_pack.bsp";
@@ -1262,13 +1273,37 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
             if(g_hanim==0||g_hanim==8)KillTimer(hw,42);
         }
         break;
+    case WM_FIRST_LAUNCH:{
+        // Sélectionner et démarrer automatiquement la dernière skybox
+        wchar_t last[MAX_PATH]={};
+        {HKEY hk;
+        if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,KEY_READ,&hk)==ERROR_SUCCESS){
+            DWORD sz=sizeof(last);
+            RegQueryValueExW(hk,L"LastSkybox",nullptr,nullptr,(BYTE*)last,&sz);
+            RegCloseKey(hk);
+        }}
+        if(!last[0])break;
+        int count=(int)SendMessageW(g_list,LB_GETCOUNT,0,0);
+        for(int i=0;i<count;i++){
+            wchar_t name[MAX_PATH]={};SendMessageW(g_list,LB_GETTEXT,i,(LPARAM)name);
+            if(wcscmp(name,last)==0){
+                SendMessageW(g_list,LB_SETCURSEL,i,0);
+                auto sav=selected_save();
+                if(!sav.empty())std::thread([sav]{update_preview_save(sav);}).detach();
+                // Démarrer le watcher automatiquement
+                PostMessageW(hw,WM_COMMAND,MAKEWPARAM(IDC_WATCH,BN_CLICKED),(LPARAM)g_btn_watch);
+                break;
+            }
+        }
+        break;
+    }
     case WM_CLOSE:{
         // Minimiser dans le tray au lieu de quitter
         NOTIFYICONDATAW nid={sizeof(nid)};
         nid.hWnd=hw;nid.uID=IDI_TRAY;
         nid.uFlags=NIF_ICON|NIF_TIP|NIF_MESSAGE;
         nid.uCallbackMessage=WM_TRAY;
-        nid.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
+        nid.hIcon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));
         wcscpy_s(nid.szTip,L"Skybox — watcher actif");
         Shell_NotifyIconW(NIM_ADD,&nid);
         ShowWindow(hw,SW_HIDE);
@@ -1285,6 +1320,23 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
             Shell_NotifyIconW(NIM_DELETE,&nid);
             ShowWindow(hw,SW_SHOW);SetForegroundWindow(hw);
             if(g_preview)ShowWindow(g_preview,SW_SHOWNOACTIVATE);
+        }
+        else if(lp==WM_RBUTTONUP){
+            HMENU menu=CreatePopupMenu();
+            AppendMenuW(menu,MF_STRING,1,L"Ouvrir");
+            AppendMenuW(menu,MF_SEPARATOR,0,nullptr);
+            AppendMenuW(menu,MF_STRING,2,L"Quitter");
+            POINT pt;GetCursorPos(&pt);
+            SetForegroundWindow(hw);
+            int cmd=TrackPopupMenu(menu,TPM_RETURNCMD|TPM_RIGHTBUTTON,pt.x,pt.y,0,hw,nullptr);
+            DestroyMenu(menu);
+            if(cmd==1){
+                NOTIFYICONDATAW nid={sizeof(nid)};nid.hWnd=hw;nid.uID=IDI_TRAY;
+                Shell_NotifyIconW(NIM_DELETE,&nid);
+                ShowWindow(hw,SW_SHOW);SetForegroundWindow(hw);
+                if(g_preview)ShowWindow(g_preview,SW_SHOWNOACTIVATE);
+            }
+            else if(cmd==2){ DestroyWindow(hw); }
         }
         break;
     case WM_DESTROY:
@@ -1372,7 +1424,14 @@ static LRESULT CALLBACK SetupWndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
 }
 
 // ── WinMain ────────────────────────────────────────────────────────────────────
-int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
+int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR lpCmd,int){
+    // ── Instance unique ────────────────────────────────────────────────────────
+    HANDLE hMutex=CreateMutexW(nullptr,TRUE,L"SkyboxcppMutex_v1");
+    if(GetLastError()==ERROR_ALREADY_EXISTS){
+        if(hMutex)CloseHandle(hMutex);
+        return 0; // déjà en cours d'exécution
+    }
+    // ── Élévation admin ────────────────────────────────────────────────────────
     BOOL adm=FALSE;HANDLE tok;
     if(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&tok)){
         TOKEN_ELEVATION te;DWORD sz;
@@ -1380,9 +1439,12 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
         CloseHandle(tok);
     }
     if(!adm){
+        if(hMutex){ReleaseMutex(hMutex);CloseHandle(hMutex);}
         wchar_t path[MAX_PATH];GetModuleFileNameW(nullptr,path,MAX_PATH);
-        ShellExecuteW(nullptr,L"runas",path,nullptr,nullptr,SW_SHOW);return 0;
+        ShellExecuteW(nullptr,L"runas",path,lpCmd,nullptr,SW_SHOW);return 0;
     }
+    // ── Démarrage en arrière-plan si /startup ──────────────────────────────────
+    g_start_hidden=(lpCmd&&wcsstr(lpCmd,L"/startup")!=nullptr);
     CoInitialize(nullptr);
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_WIN95_CLASSES};InitCommonControlsEx(&icc);
     // ── Setup premier lancement ────────────────────────────────────────────────
@@ -1476,7 +1538,8 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
                 RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Microsoft\\Windows\\CurrentVersion\\Run",0,KEY_SET_VALUE,&hk);
                 if(checked){
                     wchar_t path[MAX_PATH]={};GetModuleFileNameW(nullptr,path,MAX_PATH);
-                    RegSetValueExW(hk,L"Skybox",0,REG_SZ,(BYTE*)path,(DWORD)((wcslen(path)+1)*sizeof(wchar_t)));
+                    std::wstring val=std::wstring(L"\"")+path+L"\" /startup";
+                    RegSetValueExW(hk,L"Skybox",0,REG_SZ,(BYTE*)val.c_str(),(DWORD)((val.size()+1)*sizeof(wchar_t)));
                 }else{
                     RegDeleteValueW(hk,L"Skybox");
                 }
@@ -1520,22 +1583,37 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
         RegCloseKey(hk);
     }}
     // ── Fenêtre principale ─────────────────────────────────────────────────────
-    WNDCLASSW wc={};
+    HICON g_app_icon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));
+    WNDCLASSEXW wc={sizeof(wc)};
     wc.lpfnWndProc=WndProc;wc.hInstance=hi;wc.lpszClassName=L"SI2";
     wc.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);
     wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
-    wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
-    RegisterClassW(&wc);
+    wc.hIcon  =g_app_icon;
+    wc.hIconSm=g_app_icon;
+    RegisterClassExW(&wc);
     HWND hw=CreateWindowW(L"SI2",L"Skyboxc++",
         WS_OVERLAPPEDWINDOW&~(WS_MAXIMIZEBOX|WS_THICKFRAME),
         CW_USEDEFAULT,CW_USEDEFAULT,665,380,nullptr,nullptr,hi,nullptr);
-    ShowWindow(hw,SW_SHOW);UpdateWindow(hw);
+    SendMessageW(hw,WM_SETICON,ICON_BIG,(LPARAM)g_app_icon);
+    SendMessageW(hw,WM_SETICON,ICON_SMALL,(LPARAM)g_app_icon);
+    if(g_start_hidden){
+        // Démarrage silencieux : fenêtre cachée, icône tray immédiate
+        NOTIFYICONDATAW nid={sizeof(nid)};
+        nid.hWnd=hw;nid.uID=IDI_TRAY;
+        nid.uFlags=NIF_ICON|NIF_TIP|NIF_MESSAGE;
+        nid.uCallbackMessage=WM_TRAY;
+        nid.hIcon=LoadIconW(GetModuleHandleW(nullptr),MAKEINTRESOURCEW(1));
+        wcscpy_s(nid.szTip,L"Skyboxc++ — actif");
+        Shell_NotifyIconW(NIM_ADD,&nid);
+    } else {
+        ShowWindow(hw,SW_SHOW);UpdateWindow(hw);
+    }
     // Fenêtre aperçu séparée, placée à droite de la fenêtre principale
     {RECT mwr;GetWindowRect(hw,&mwr);
     g_preview=CreateWindowW(L"PREVWND",L"Aperçu skybox",
         WS_OVERLAPPEDWINDOW&~WS_MAXIMIZEBOX,
         mwr.right+8,mwr.top,680,540,hw,nullptr,hi,nullptr);
-    ShowWindow(g_preview,SW_SHOW);UpdateWindow(g_preview);}
+    if(!g_start_hidden){ShowWindow(g_preview,SW_SHOW);UpdateWindow(g_preview);}}
     MSG m;while(GetMessageW(&m,nullptr,0,0)){TranslateMessage(&m);DispatchMessageW(&m);}
     CoUninitialize();return(int)m.wParam;
 }
