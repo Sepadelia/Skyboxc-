@@ -9,6 +9,8 @@
 #include <commdlg.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <uxtheme.h>
+#pragma comment(lib,"uxtheme.lib")
 #include <string>
 #include <vector>
 #include <map>
@@ -35,7 +37,7 @@ static const wchar_t* FLABELS[6] = {L"ft:",L"bk:",L"lf:",L"rt:",L"up:",L"dn:"};
 // ── IDs ────────────────────────────────────────────────────────────────────────
 enum {
     // Mode tabs
-    IDC_TAB_CREATE=1, IDC_TAB_LAUNCH=2,
+    IDC_TAB_CREATE=1, IDC_TAB_LAUNCH=2, IDC_TAB_PURGE=3,
     // Créateur
     IDC_NAME=10, IDC_RADIO_MAN=11, IDC_RADIO_DIR=12,
     IDC_DIR_EDIT=13, IDC_DIR_BROWSE=14,
@@ -47,6 +49,10 @@ enum {
     // Lanceur
     IDC_LISTBOX=60, IDC_REFRESH=61,
     IDC_WATCH=62, IDC_LOCK=63, IDC_PERM=64,
+    // Purge
+    IDC_PURGE_LIST=110, IDC_PURGE_REFRESH=111,
+    IDC_PURGE_SKY=112, IDC_PURGE_PATH=113, IDC_PURGE_BROWSE=114,
+    IDC_PURGE_APPLY=115,
     // Common
     IDC_STATUS=80,
 };
@@ -79,8 +85,30 @@ static HWND g_btn_watch=nullptr, g_btn_lock=nullptr, g_btn_perm=nullptr;
 static HWND g_ready_lbl=nullptr;
 static COLORREF g_ready_col=RGB(60,60,60);
 static HBRUSH g_ready_br=nullptr;
-static bool g_mode_create=false; // true=Créateur, false=Lanceur
-static bool g_folder_mode=false; // true=Dossier, false=Manuel
+// Purge controls
+static HWND g_purge_list=nullptr, g_purge_refresh=nullptr;
+static HWND g_purge_sky=nullptr, g_purge_path=nullptr, g_purge_browse=nullptr;
+static HWND g_purge_apply=nullptr, g_purge_btn_repo=nullptr;
+static HWND g_purge_lbl_sav=nullptr, g_purge_lbl_sky=nullptr, g_purge_lbl_dir=nullptr;
+
+static bool g_mode_create=false;
+static bool g_mode_purge=false;
+static bool g_folder_mode=false;
+
+// ── Dark theme ────────────────────────────────────────────────────────────────
+#define DK_BG     RGB(18,18,20)
+#define DK_PANEL  RGB(30,30,33)
+#define DK_CTRL   RGB(42,42,48)
+#define DK_HOVER  RGB(55,55,62)
+#define DK_ACCENT RGB(0,120,212)
+#define DK_ACCHV  RGB(25,140,232)
+#define DK_TEXT   RGB(220,220,224)
+static HBRUSH g_br_bg=nullptr,g_br_panel=nullptr,g_br_ctrl=nullptr;
+static HWND g_tab_launch=nullptr,g_tab_purge=nullptr,g_tab_create=nullptr,g_btn_settings=nullptr;
+static HWND g_hover_tab=nullptr;
+static int  g_hanim=0;
+static bool g_hanim_in=false,g_tmouse=false;
+static HICON g_ico_folder=nullptr,g_ico_gear=nullptr;
 
 static std::atomic<bool> g_watching{false};
 static std::thread        g_wthread;
@@ -481,6 +509,25 @@ static void show_launch_controls(bool show){
     ShowWindow(g_list,sw);ShowWindow(g_refresh,sw);ShowWindow(g_btn_repo,sw);
     ShowWindow(g_btn_watch,sw);ShowWindow(g_ready_lbl,sw);
 }
+static void show_purge_controls(bool show){
+    int sw=show?SW_SHOW:SW_HIDE;
+    ShowWindow(g_purge_lbl_sav,sw);ShowWindow(g_purge_refresh,sw);ShowWindow(g_purge_btn_repo,sw);ShowWindow(g_purge_list,sw);
+    ShowWindow(g_purge_lbl_sky,sw);ShowWindow(g_purge_sky,sw);
+    ShowWindow(g_purge_lbl_dir,sw);ShowWindow(g_purge_path,sw);ShowWindow(g_purge_browse,sw);
+    ShowWindow(g_purge_apply,sw);
+}
+static void refresh_purge_saves(){
+    SendMessageW(g_purge_list,LB_RESETCONTENT,0,0);
+    WIN32_FIND_DATAW fd;
+    HANDLE h=FindFirstFileW((std::wstring(SAVE_DIR)+L"\\*").c_str(),&fd);
+    if(h==INVALID_HANDLE_VALUE)return;
+    do{
+        if((fd.dwFileAttributes&FILE_ATTRIBUTE_DIRECTORY)&&fd.cFileName[0]!=L'.')
+            SendMessageW(g_purge_list,LB_ADDSTRING,0,(LPARAM)fd.cFileName);
+    }while(FindNextFileW(h,&fd));
+    FindClose(h);
+    if(SendMessageW(g_purge_list,LB_GETCOUNT,0,0)>0)SendMessageW(g_purge_list,LB_SETCURSEL,0,0);
+}
 
 // ── Browse folder (SHBrowseForFolder) ─────────────────────────────────────────
 static std::wstring browse_folder(){
@@ -588,7 +635,10 @@ static void update_preview_save(const std::wstring&dir){
 // ── Preview window WndProc (fenêtre séparée) ──────────────────────────────────
 static LRESULT CALLBACK PreviewWndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     if(msg==WM_ERASEBKGND)return 1;
-    if(msg==WM_CLOSE){ShowWindow(hw,SW_HIDE);return 0;} // cacher plutôt que détruire
+    if(msg==WM_CLOSE){if(g_hwnd)SendMessageW(g_hwnd,WM_CLOSE,0,0);return 0;}
+    if(msg==WM_SIZE){if(wp==SIZE_MINIMIZED&&g_hwnd)ShowWindow(g_hwnd,SW_MINIMIZE);
+        else if(wp==SIZE_RESTORED&&g_hwnd)ShowWindow(g_hwnd,SW_SHOWNOACTIVATE);}
+
     if(msg==WM_PAINT){
         PAINTSTRUCT ps;HDC hdc=BeginPaint(hw,&ps);
         RECT rc;GetClientRect(hw,&rc);
@@ -649,10 +699,15 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         g_hwnd=hw;
         CreateDirectoryW(SAVE_DIR.c_str(),nullptr);
 
+        // ── Icône dossier chargée en premier ────────────────────────────────
+        {SHSTOCKICONINFO sii={sizeof(sii)};
+         if(SUCCEEDED(SHGetStockIconInfo(SIID_FOLDER,SHGSI_ICON|SHGSI_SMALLICON,&sii)))g_ico_folder=sii.hIcon;}
+
         // ── Mode tab buttons ────────────────────────────────────────────────
-        CreateWindowW(L"BUTTON",L"LANCEUR", WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,5,5,100,26,hw,(HMENU)IDC_TAB_LAUNCH,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"CRÉATEUR",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,110,5,100,26,hw,(HMENU)IDC_TAB_CREATE,nullptr,nullptr);
-        CreateWindowW(L"BUTTON",L"⚙ Paramètres",WS_CHILD|WS_VISIBLE|BS_PUSHBUTTON,500,5,145,26,hw,(HMENU)IDC_SETTINGS,nullptr,nullptr);
+        g_tab_launch  =CreateWindowW(L"BUTTON",L"SKYBOX ROCKFORD",WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,5,  5,150,26,hw,(HMENU)IDC_TAB_LAUNCH,nullptr,nullptr);
+        g_tab_purge   =CreateWindowW(L"BUTTON",L"SKYBOX PURGE",   WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,160,5,130,26,hw,(HMENU)IDC_TAB_PURGE, nullptr,nullptr);
+        g_tab_create  =CreateWindowW(L"BUTTON",L"CRÉATEUR",       WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,295,5,100,26,hw,(HMENU)IDC_TAB_CREATE,nullptr,nullptr);
+        g_btn_settings=CreateWindowW(L"BUTTON",L"Paramètres",     WS_CHILD|WS_VISIBLE|BS_OWNERDRAW,500,5,145,26,hw,(HMENU)IDC_SETTINGS,nullptr,nullptr);
 
         int y=38;
         // ── Créateur: nom ───────────────────────────────────────────────────
@@ -669,7 +724,8 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         // ── Dossier picker (hidden by default) ──────────────────────────────
         g_dir_lbl=CreateWindowW(L"STATIC",L"Dossier:",WS_CHILD,5,y,60,20,hw,nullptr,nullptr,nullptr);
         g_dir_edit=CreateWindowW(L"EDIT",L"",WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,70,y,510,20,hw,(HMENU)IDC_DIR_EDIT,nullptr,nullptr);
-        g_dir_browse=CreateWindowW(L"BUTTON",L"...",WS_CHILD,585,y,55,20,hw,(HMENU)IDC_DIR_BROWSE,nullptr,nullptr);
+        g_dir_browse=CreateWindowW(L"BUTTON",L"",WS_CHILD|BS_ICON,585,y,36,20,hw,(HMENU)IDC_DIR_BROWSE,nullptr,nullptr);
+        if(g_ico_folder)SendMessageW(g_dir_browse,BM_SETIMAGE,IMAGE_ICON,(LPARAM)g_ico_folder);
         // group list: y+26 .. y+26+130=y+156; rename: y+162
         g_group_list=CreateWindowW(L"LISTBOX",nullptr,WS_CHILD|WS_BORDER|WS_VSCROLL|LBS_NOTIFY,5,y+26,645,130,hw,(HMENU)IDC_GROUP_LIST,nullptr,nullptr);
         g_rename_lbl=CreateWindowW(L"STATIC",L"Renommer:",WS_CHILD,5,y+162,70,20,hw,nullptr,nullptr,nullptr);
@@ -683,16 +739,18 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         }
         // Save button fixed at y+192 (below both modes)
         g_save_btn=CreateWindowW(L"BUTTON",L"SAUVEGARDER LES TEXTURES",WS_CHILD|WS_VISIBLE,5,y+192,220,26,hw,(HMENU)IDC_SAVE_BTN,nullptr,nullptr);
-        g_btn_repo_create=CreateWindowW(L"BUTTON",L"📂",WS_CHILD|WS_VISIBLE,230,y+192,30,26,hw,(HMENU)IDC_OPEN_REPO,nullptr,nullptr);
+        g_btn_repo_create=CreateWindowW(L"BUTTON",L"",WS_CHILD|WS_VISIBLE|BS_ICON,230,y+192,36,26,hw,(HMENU)IDC_OPEN_REPO,nullptr,nullptr);
+        if(g_ico_folder)SendMessageW(g_btn_repo_create,BM_SETIMAGE,IMAGE_ICON,(LPARAM)g_ico_folder);
 
         // ── Lanceur: listbox (hidden) ────────────────────────────────────────
         // Listbox width = 645 (x=5..650). RAFRAÎCHIR + 📂 au-dessus à droite.
         CreateWindowW(L"STATIC",L"Sauvegardes:",WS_CHILD,5,38,100,20,hw,nullptr,nullptr,nullptr);
         g_refresh=CreateWindowW(L"BUTTON",L"RAFRAÎCHIR",WS_CHILD,490,36,90,22,hw,(HMENU)IDC_REFRESH,nullptr,nullptr);
-        g_btn_repo=CreateWindowW(L"BUTTON",L"\U0001F4C2",WS_CHILD,585,36,60,22,hw,(HMENU)IDC_OPEN_REPO,nullptr,nullptr);
+        g_btn_repo=CreateWindowW(L"BUTTON",L"",WS_CHILD|BS_ICON,585,36,40,22,hw,(HMENU)IDC_OPEN_REPO,nullptr,nullptr);
+        if(g_ico_folder)SendMessageW(g_btn_repo,BM_SETIMAGE,IMAGE_ICON,(LPARAM)g_ico_folder);
         g_list=CreateWindowW(L"LISTBOX",nullptr,WS_CHILD|WS_BORDER|WS_VSCROLL|LBS_NOTIFY,5,60,640,200,hw,(HMENU)IDC_LISTBOX,nullptr,nullptr);
         int by=270;
-        g_btn_watch=CreateWindowW(L"BUTTON",L"START",WS_CHILD,5,by,110,30,hw,(HMENU)IDC_WATCH,nullptr,nullptr);
+        g_btn_watch=CreateWindowW(L"BUTTON",L"APPLIQUER",WS_CHILD,5,by,110,30,hw,(HMENU)IDC_WATCH,nullptr,nullptr);
         // Indicateur restart — SS_CENTER|SS_CENTERIMAGE pour centrer le texte
         g_ready_lbl=CreateWindowW(L"STATIC",L"",WS_CHILD|SS_CENTER|SS_CENTERIMAGE,120,by,530,30,hw,nullptr,nullptr,nullptr);
         {HFONT hf=CreateFontW(17,0,0,0,FW_BOLD,FALSE,FALSE,FALSE,DEFAULT_CHARSET,OUT_DEFAULT_PRECIS,CLIP_DEFAULT_PRECIS,DEFAULT_QUALITY,DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
@@ -700,8 +758,27 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         g_btn_lock=CreateWindowW(L"BUTTON",L"LOCK",WS_CHILD,5,by+50,80,26,hw,(HMENU)IDC_LOCK,nullptr,nullptr);   // caché
         g_btn_perm=CreateWindowW(L"BUTTON",L"PERMANENT",WS_CHILD,5,by+80,110,26,hw,(HMENU)IDC_PERM,nullptr,nullptr); // caché
 
+        // ── Purge controls (cachés par défaut) ──────────────────────────────
+        {// Chemin addon par défaut dérivé du CACHE_DIR
+        std::wstring gmod_gg=CACHE_DIR;
+        size_t pc=gmod_gg.rfind(L'\\');if(pc!=std::wstring::npos)gmod_gg=gmod_gg.substr(0,pc);
+        std::wstring purge_def=gmod_gg+L"\\addons\\css-content-gmodcontent\\materials\\skybox";
+        g_purge_lbl_sav=CreateWindowW(L"STATIC",L"Sauvegardes:",WS_CHILD,5,38,100,20,hw,nullptr,nullptr,nullptr);
+        g_purge_refresh=CreateWindowW(L"BUTTON",L"RAFRAÎCHIR",WS_CHILD,490,36,90,22,hw,(HMENU)IDC_PURGE_REFRESH,nullptr,nullptr);
+        g_purge_btn_repo=CreateWindowW(L"BUTTON",L"",WS_CHILD|BS_ICON,585,36,40,22,hw,(HMENU)IDC_OPEN_REPO,nullptr,nullptr);
+        if(g_ico_folder)SendMessageW(g_purge_btn_repo,BM_SETIMAGE,IMAGE_ICON,(LPARAM)g_ico_folder);
+        g_purge_list=CreateWindowW(L"LISTBOX",nullptr,WS_CHILD|WS_BORDER|WS_VSCROLL|LBS_NOTIFY,5,60,640,155,hw,(HMENU)IDC_PURGE_LIST,nullptr,nullptr);
+        g_purge_lbl_sky=CreateWindowW(L"STATIC",L"Nom skybox :",WS_CHILD,5,224,90,20,hw,nullptr,nullptr,nullptr);
+        g_purge_sky=CreateWindowW(L"EDIT",L"grimmnight",WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,98,222,160,22,hw,(HMENU)IDC_PURGE_SKY,nullptr,nullptr);
+        g_purge_lbl_dir=CreateWindowW(L"STATIC",L"Dossier :",WS_CHILD,5,252,70,20,hw,nullptr,nullptr,nullptr);
+        g_purge_path=CreateWindowW(L"EDIT",purge_def.c_str(),WS_CHILD|WS_BORDER|ES_AUTOHSCROLL,78,250,520,22,hw,(HMENU)IDC_PURGE_PATH,nullptr,nullptr);
+        g_purge_browse=CreateWindowW(L"BUTTON",L"",WS_CHILD|BS_ICON,602,250,40,22,hw,(HMENU)IDC_PURGE_BROWSE,nullptr,nullptr);
+        if(g_ico_folder)SendMessageW(g_purge_browse,BM_SETIMAGE,IMAGE_ICON,(LPARAM)g_ico_folder);
+        g_purge_apply=CreateWindowW(L"BUTTON",L"APPLIQUER",WS_CHILD,5,282,110,28,hw,(HMENU)IDC_PURGE_APPLY,nullptr,nullptr);}
+
         // Lanceur par défaut
         show_create_controls(false);
+        show_purge_controls(false);
         show_launch_controls(true);
         refresh_saves();
         // Show créateur label for dir (hidden since Manuel mode)
@@ -709,6 +786,34 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
 
         // ── Status ───────────────────────────────────────────────────────────
         g_status=CreateWindowW(L"STATIC",L"",WS_CHILD|WS_VISIBLE|SS_CENTER,5,y+224,645,20,hw,(HMENU)IDC_STATUS,nullptr,nullptr);
+
+        // ── Dark theme init ───────────────────────────────────────────────────
+        g_br_bg   =CreateSolidBrush(DK_BG);
+        g_br_panel=CreateSolidBrush(DK_PANEL);
+        g_br_ctrl =CreateSolidBrush(DK_CTRL);
+        // Barre ready invisible par défaut (fond identique au BG)
+        g_ready_col=DK_BG;
+        g_ready_br =CreateSolidBrush(DK_BG);
+        // Icône engrenage pour le bouton Paramètres
+        if(!ExtractIconExW(L"C:\\Windows\\System32\\imageres.dll",109,nullptr,&g_ico_gear,1)||!g_ico_gear)
+            ExtractIconExW(L"C:\\Windows\\System32\\shell32.dll",315,nullptr,&g_ico_gear,1);
+        // Retirer les themes sur les boutons BS_ICON pour qu'ils dessinent l'icône correctement
+        if(g_ico_folder){auto fi2=[](HWND b){if(b)SetWindowTheme(b,L"",L"");};
+        fi2(g_dir_browse);fi2(g_btn_repo);fi2(g_btn_repo_create);fi2(g_purge_btn_repo);fi2(g_purge_browse);}
+        // SetWindowTheme sur tous les boutons non-owner-draw
+        auto tb=[](HWND b){if(b)SetWindowTheme(b,L"",L"");};
+        tb(g_refresh);tb(g_btn_repo);tb(g_btn_watch);tb(g_btn_lock);tb(g_btn_perm);
+        tb(g_purge_refresh);tb(g_purge_btn_repo);tb(g_purge_apply);tb(g_save_btn);tb(g_btn_repo_create);
+        tb(g_rad_man);tb(g_rad_dir);
+        // SetWindowTheme sur tous les edits pour forcer fond sombre
+        auto te=[](HWND e){if(e)SetWindowTheme(e,L"",L"");};
+        te(g_name);te(g_dir_edit);te(g_rename_edit);
+        for(int i=0;i<6;i++)te(g_edits[i]);
+        te(g_purge_sky);te(g_purge_path);
+        // Dark scrollbar dans les listbox
+        SetWindowTheme(g_list,L"DarkMode_Explorer",nullptr);
+        SetWindowTheme(g_purge_list,L"DarkMode_Explorer",nullptr);
+        SetWindowTheme(g_group_list,L"DarkMode_Explorer",nullptr);
         break;
     }
 
@@ -744,18 +849,33 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         }
         case IDC_TAB_CREATE:
             if(!g_mode_create){
-                g_mode_create=true;
+                g_mode_create=true;g_mode_purge=false;
                 show_launch_controls(false);
+                show_purge_controls(false);
                 show_create_controls(true);
-                SetWindowTextW(g_status,L""); // efface les messages du lanceur
+                SetWindowTextW(g_status,L"");
+                InvalidateRect(g_tab_launch,nullptr,TRUE);InvalidateRect(g_tab_purge,nullptr,TRUE);InvalidateRect(g_tab_create,nullptr,TRUE);
             }
             break;
         case IDC_TAB_LAUNCH:
-            if(g_mode_create){
-                g_mode_create=false;
+            if(g_mode_create||g_mode_purge){
+                g_mode_create=false;g_mode_purge=false;
                 show_create_controls(false);
+                show_purge_controls(false);
                 show_launch_controls(true);
                 refresh_saves();
+                InvalidateRect(g_tab_launch,nullptr,TRUE);InvalidateRect(g_tab_purge,nullptr,TRUE);InvalidateRect(g_tab_create,nullptr,TRUE);
+            }
+            break;
+        case IDC_TAB_PURGE:
+            if(!g_mode_purge){
+                g_mode_purge=true;g_mode_create=false;
+                show_create_controls(false);
+                show_launch_controls(false);
+                show_purge_controls(true);
+                refresh_purge_saves();
+                SetWindowTextW(g_status,L"");
+                InvalidateRect(g_tab_launch,nullptr,TRUE);InvalidateRect(g_tab_purge,nullptr,TRUE);InvalidateRect(g_tab_create,nullptr,TRUE);
             }
             break;
 
@@ -851,11 +971,60 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
             }
             break;
         case IDC_REFRESH: refresh_saves(); break;
+        case IDC_PURGE_REFRESH: refresh_purge_saves(); break;
+        case IDC_PURGE_BROWSE:{
+            wchar_t buf[MAX_PATH]={};
+            BROWSEINFOW bi={};bi.hwndOwner=hw;bi.pszDisplayName=buf;
+            bi.lpszTitle=L"Sélectionne le dossier skybox de l'addon";bi.ulFlags=BIF_RETURNONLYFSDIRS|BIF_NEWDIALOGSTYLE;
+            LPITEMIDLIST il=SHBrowseForFolderW(&bi);
+            if(il){wchar_t p[MAX_PATH]={};SHGetPathFromIDListW(il,p);CoTaskMemFree(il);SetWindowTextW(g_purge_path,p);}
+            break;
+        }
+        case IDC_PURGE_APPLY:{
+            // Récupérer la save sélectionnée
+            int idx=(int)SendMessageW(g_purge_list,LB_GETCURSEL,0,0);
+            if(idx<0){ui_status(L"Sélectionne une sauvegarde",RGB(200,0,0));break;}
+            int len=(int)SendMessageW(g_purge_list,LB_GETTEXTLEN,idx,0);
+            std::wstring sname(len,L'\0');
+            SendMessageW(g_purge_list,LB_GETTEXT,idx,(LPARAM)sname.data());
+            std::wstring savedir=std::wstring(SAVE_DIR)+L"\\"+sname;
+            // Skyname
+            wchar_t sky[256]={};GetWindowTextW(g_purge_sky,sky,256);
+            if(!sky[0]){ui_status(L"Entre un nom de skybox (ex: grimmnight)",RGB(200,0,0));break;}
+            // Dossier destination
+            wchar_t tpath[MAX_PATH]={};GetWindowTextW(g_purge_path,tpath,MAX_PATH);
+            if(!tpath[0]){ui_status(L"Entre le dossier de destination",RGB(200,0,0));break;}
+            // Créer le dossier (et parents) si besoin
+            SHCreateDirectoryExW(nullptr,tpath,nullptr);
+            // Copier et renommer chaque face
+            int copied=0;
+            for(int i=0;i<6;i++){
+                std::wstring src=savedir+L"\\"+std::wstring(FACES[i],FACES[i]+2)+L".vtf";
+                std::wstring dst=std::wstring(tpath)+L"\\"+std::wstring(sky)+std::wstring(FACES[i],FACES[i]+2)+L".vtf";
+                auto data=fread_all(src);
+                if(!data.empty()&&fwrite_all(dst,data))copied++;
+            }
+            if(copied==0)ui_status(L"Aucun VTF trouvé dans la sauvegarde",RGB(200,0,0));
+            else ui_status(L"✓ "+std::to_wstring(copied)+L"/6 textures appliquées — relance GMod",RGB(0,140,0));
+            break;
+        }
         case IDC_LISTBOX:
             if(HIWORD(wp)==LBN_SELCHANGE){
                 auto sav=selected_save();
                 if(!sav.empty()){
                     if(g_watching)g_active_save=sav;
+                    std::thread([sav]{update_preview_save(sav);}).detach();
+                }
+            }
+            break;
+        case IDC_PURGE_LIST:
+            if(HIWORD(wp)==LBN_SELCHANGE){
+                int idx=(int)SendMessageW(g_purge_list,LB_GETCURSEL,0,0);
+                if(idx>=0){
+                    int len=(int)SendMessageW(g_purge_list,LB_GETTEXTLEN,idx,0);
+                    std::wstring sname(len,L'\0');
+                    SendMessageW(g_purge_list,LB_GETTEXT,idx,(LPARAM)sname.data());
+                    std::wstring sav=std::wstring(SAVE_DIR)+L"\\"+sname;
                     std::thread([sav]{update_preview_save(sav);}).detach();
                 }
             }
@@ -877,7 +1046,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
                 g_perm_pending=true;
                 // "En attente" seulement si pas de BSP en cache — sinon le watcher va mettre vert immédiatement
                 if(find_cache_bsp().empty())PostMessageW(hw,WM_SETREADY,0,0);
-                g_watching=true;SetWindowTextW(g_btn_watch,L"STOP");
+                g_watching=true;SetWindowTextW(g_btn_watch,L"ARRÊTER");
                 if(g_wthread.joinable()){g_watching=false;if(g_dir_handle!=INVALID_HANDLE_VALUE)CancelIoEx(g_dir_handle,nullptr);g_wthread.join();g_watching=true;}
                 g_wthread=std::thread(watch_fn);
                 std::thread(gmod_exit_watcher).detach();
@@ -892,7 +1061,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
                 SetFileAttributesW(dest.c_str(),FILE_ATTRIBUTE_NORMAL);
                 g_permanent=false;g_perm_pending=false;
                 PostMessageW(hw,WM_SETREADY,2,0); // arrêté
-                SetWindowTextW(g_btn_watch,L"START");
+                SetWindowTextW(g_btn_watch,L"APPLIQUER");
                 ui_status(L"Arrêté — verrou retiré",RGB(0,140,0));
             }
             break;
@@ -961,7 +1130,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
 
     case WM_SETREADY:{
         // wp=0: en attente (orange), 1: prêt (vert), 2: arrêté (gris)
-        static const COLORREF COLS[3]={RGB(170,90,0),RGB(0,120,0),RGB(50,50,50)};
+        static const COLORREF COLS[3]={RGB(170,90,0),RGB(0,140,0),DK_BG};
         static const wchar_t*TXTS[3]={L"⏳  En attente du BSP…",L"✅  Tu peux restart !",L""};
         g_ready_col=COLS[wp];
         if(g_ready_br){DeleteObject(g_ready_br);g_ready_br=nullptr;}
@@ -985,6 +1154,29 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         EnableWindow(g_btn_perm,TRUE);
         SetWindowTextW(g_btn_perm,wp?L"DEPERM":L"PERMANENT");
         break;
+    case WM_ERASEBKGND:{
+        RECT rc;GetClientRect(hw,&rc);
+        FillRect((HDC)wp,&rc,g_br_bg?g_br_bg:GetSysColorBrush(COLOR_BTNFACE));
+        return 1;
+    }
+    case WM_CTLCOLOREDIT:{
+        HDC hdc=(HDC)wp;
+        SetTextColor(hdc,DK_TEXT);SetBkColor(hdc,DK_CTRL);
+        return(LRESULT)(g_br_ctrl?g_br_ctrl:GetSysColorBrush(COLOR_WINDOW));
+    }
+    case WM_CTLCOLORLISTBOX:{
+        HDC hdc=(HDC)wp;
+        SetTextColor(hdc,DK_TEXT);SetBkColor(hdc,DK_PANEL);
+        return(LRESULT)(g_br_panel?g_br_panel:GetSysColorBrush(COLOR_WINDOW));
+    }
+    case WM_CTLCOLORBTN:{
+        HDC hdc=(HDC)wp;HWND hb=(HWND)lp;
+        if(hb!=g_tab_launch&&hb!=g_tab_purge&&hb!=g_tab_create&&hb!=g_btn_settings){
+            SetTextColor(hdc,DK_TEXT);SetBkColor(hdc,DK_PANEL);
+            return(LRESULT)(g_br_panel?g_br_panel:GetSysColorBrush(COLOR_BTNFACE));
+        }
+        return DefWindowProcW(hw,msg,wp,lp);
+    }
     case WM_CTLCOLORSTATIC:{
         HDC hdc=(HDC)wp;
         if((HWND)lp==g_ready_lbl){
@@ -994,9 +1186,82 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
             return(LRESULT)(g_ready_br?g_ready_br:GetSysColorBrush(COLOR_BTNFACE));
         }
         if((HWND)lp==g_status)SetTextColor(hdc,g_status_col);
+        else SetTextColor(hdc,DK_TEXT);
         SetBkMode(hdc,TRANSPARENT);
-        return(LRESULT)GetSysColorBrush(COLOR_BTNFACE);
+        return(LRESULT)(g_br_bg?g_br_bg:GetSysColorBrush(COLOR_BTNFACE));
     }
+    case WM_DRAWITEM:{
+        DRAWITEMSTRUCT*di=(DRAWITEMSTRUCT*)lp;
+        UINT id=di->CtlID;
+        if(id!=IDC_TAB_LAUNCH&&id!=IDC_TAB_PURGE&&id!=IDC_TAB_CREATE&&id!=IDC_SETTINGS)break;
+        HDC dc=di->hDC;RECT rc=di->rcItem;
+        bool isTab=(id!=IDC_SETTINGS);
+        bool active=(id==IDC_TAB_LAUNCH&&!g_mode_create&&!g_mode_purge)||
+                    (id==IDC_TAB_PURGE&&g_mode_purge)||
+                    (id==IDC_TAB_CREATE&&g_mode_create);
+        bool hov=(di->hwndItem==g_hover_tab);
+        // Couleur de fond interpolée
+        float t=(float)g_hanim/8.f;
+        auto lerp=[](int a,int b,float f)->int{return a+(int)((b-a)*f);};
+        auto lerpc=[&](COLORREF a,COLORREF b)->COLORREF{
+            return RGB(lerp(GetRValue(a),GetRValue(b),t),
+                       lerp(GetGValue(a),GetGValue(b),t),
+                       lerp(GetBValue(a),GetBValue(b),t));};
+        COLORREF bgBase=active?DK_ACCENT:DK_PANEL;
+        COLORREF bgHov =active?DK_ACCHV:DK_HOVER;
+        COLORREF bg=hov?lerpc(bgBase,bgHov):bgBase;
+        HBRUSH br=CreateSolidBrush(bg);FillRect(dc,&rc,br);DeleteObject(br);
+        // Bordure du bas pour onglet actif (3px)
+        if(isTab&&active){
+            HPEN pen=CreatePen(PS_SOLID,3,DK_ACCHV);
+            HPEN op=(HPEN)SelectObject(dc,pen);
+            HBRUSH brnull=(HBRUSH)SelectObject(dc,GetStockObject(NULL_BRUSH));
+            MoveToEx(dc,rc.left,rc.bottom-2,nullptr);LineTo(dc,rc.right,rc.bottom-2);
+            SelectObject(dc,op);SelectObject(dc,brnull);DeleteObject(pen);
+        }
+        // Icône engrenage pour settings
+        if(!isTab&&g_ico_gear){
+            DrawIconEx(dc,rc.left+6,(rc.bottom-rc.top-16)/2,g_ico_gear,16,16,0,nullptr,DI_NORMAL);
+        }
+        // Texte
+        SetTextColor(dc,DK_TEXT);SetBkMode(dc,TRANSPARENT);
+        RECT trc=rc;
+        if(!isTab&&g_ico_gear)trc.left+=26;
+        HFONT hf=CreateFontW(14,0,0,0,FW_SEMIBOLD,0,0,0,DEFAULT_CHARSET,0,0,CLEARTYPE_QUALITY,
+            DEFAULT_PITCH|FF_DONTCARE,L"Segoe UI");
+        HFONT of=(HFONT)SelectObject(dc,hf);
+        wchar_t txt[64]={};GetWindowTextW(di->hwndItem,txt,64);
+        DrawTextW(dc,txt,-1,&trc,DT_CENTER|DT_VCENTER|DT_SINGLELINE);
+        SelectObject(dc,of);DeleteObject(hf);
+        return TRUE;
+    }
+    case WM_MOUSEMOVE:{
+        POINT pt={(short)LOWORD(lp),(short)HIWORD(lp)};
+        HWND hov=ChildWindowFromPoint(hw,pt);
+        bool isTab=(hov==g_tab_launch||hov==g_tab_purge||hov==g_tab_create||hov==g_btn_settings);
+        HWND newtab=isTab?hov:nullptr;
+        if(newtab!=g_hover_tab){
+            HWND old=g_hover_tab;g_hover_tab=newtab;
+            if(old)InvalidateRect(old,nullptr,TRUE);
+            g_hanim_in=(newtab!=nullptr);
+            SetTimer(hw,42,16,nullptr);
+        }
+        if(!g_tmouse){TRACKMOUSEEVENT tme={sizeof(tme),TME_LEAVE,hw,0};TrackMouseEvent(&tme);g_tmouse=true;}
+        break;
+    }
+    case WM_MOUSELEAVE:{
+        if(g_hover_tab){InvalidateRect(g_hover_tab,nullptr,TRUE);g_hover_tab=nullptr;}
+        g_hanim_in=false;g_tmouse=false;SetTimer(hw,42,16,nullptr);
+        break;
+    }
+    case WM_TIMER:
+        if(wp==42){
+            if(g_hanim_in)g_hanim=(g_hanim<8?g_hanim+1:8);else g_hanim=(g_hanim>0?g_hanim-1:0);
+            HWND target=g_hover_tab?g_hover_tab:nullptr;
+            if(target)InvalidateRect(target,nullptr,TRUE);
+            if(g_hanim==0||g_hanim==8)KillTimer(hw,42);
+        }
+        break;
     case WM_CLOSE:{
         // Minimiser dans le tray au lieu de quitter
         NOTIFYICONDATAW nid={sizeof(nid)};
@@ -1007,13 +1272,19 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         wcscpy_s(nid.szTip,L"Skybox — watcher actif");
         Shell_NotifyIconW(NIM_ADD,&nid);
         ShowWindow(hw,SW_HIDE);
+        if(g_preview)ShowWindow(g_preview,SW_HIDE);
         return 0;
     }
+    case WM_SIZE:
+        if(wp==SIZE_MINIMIZED&&g_preview)ShowWindow(g_preview,SW_MINIMIZE);
+        else if(wp==SIZE_RESTORED&&g_preview)ShowWindow(g_preview,SW_SHOWNOACTIVATE);
+        break;
     case WM_TRAY:
         if(lp==WM_LBUTTONDBLCLK||lp==WM_LBUTTONUP){
             NOTIFYICONDATAW nid={sizeof(nid)};nid.hWnd=hw;nid.uID=IDI_TRAY;
             Shell_NotifyIconW(NIM_DELETE,&nid);
             ShowWindow(hw,SW_SHOW);SetForegroundWindow(hw);
+            if(g_preview)ShowWindow(g_preview,SW_SHOWNOACTIVATE);
         }
         break;
     case WM_DESTROY:
@@ -1021,6 +1292,10 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
         if(g_dir_handle!=INVALID_HANDLE_VALUE)CancelIoEx(g_dir_handle,nullptr);
         unlock_bsp();
         {NOTIFYICONDATAW nid={sizeof(nid)};nid.hWnd=hw;nid.uID=IDI_TRAY;Shell_NotifyIconW(NIM_DELETE,&nid);}
+        if(g_br_bg)DeleteObject(g_br_bg);
+        if(g_br_panel)DeleteObject(g_br_panel);
+        if(g_br_ctrl)DeleteObject(g_br_ctrl);
+        if(g_ico_gear)DestroyIcon(g_ico_gear);
         PostQuitMessage(0);
         break;
     }
@@ -1030,6 +1305,7 @@ LRESULT CALLBACK WndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
 // ── Fenêtre de setup premier lancement ────────────────────────────────────────
 static LRESULT CALLBACK SetupWndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
     static HWND eDir=nullptr;
+    static bool success=false;
     switch(msg){
     case WM_CREATE:
         CreateWindowW(L"STATIC",
@@ -1078,14 +1354,17 @@ static LRESULT CALLBACK SetupWndProc(HWND hw,UINT msg,WPARAM wp,LPARAM lp){
                 RegSetValueExW(hk,L"CacheDir",0,REG_SZ,(BYTE*)cdir,(DWORD)((wcslen(cdir)+1)*sizeof(wchar_t)));
                 RegCloseKey(hk);
             }
-            PostQuitMessage(1);
+            success=true;
+            DestroyWindow(hw);
         }
         break;
     case WM_CLOSE:
-        // Forcer la configuration — pas de fermeture sans chemin valide
         if(MessageBoxW(hw,L"Tu n'as pas configuré le dossier cache.\nQuitter l'application ?",
             L"Skybox",MB_YESNO|MB_ICONQUESTION)==IDYES)
-            PostQuitMessage(0);
+            DestroyWindow(hw);
+        break;
+    case WM_DESTROY:
+        PostQuitMessage(success?1:0);
         break;
     default:return DefWindowProcW(hw,msg,wp,lp);
     }
@@ -1107,6 +1386,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
     CoInitialize(nullptr);
     INITCOMMONCONTROLSEX icc={sizeof(icc),ICC_WIN95_CLASSES};InitCommonControlsEx(&icc);
     // ── Setup premier lancement ────────────────────────────────────────────────
+    // Essayer de détecter automatiquement via le registre Steam
     {bool configured=false;
     HKEY hk;
     if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,KEY_READ,&hk)==ERROR_SUCCESS){
@@ -1114,10 +1394,36 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
         RegCloseKey(hk);
     }
     if(!configured){
+        // Lire SteamPath depuis le registre
+        wchar_t steamPath[MAX_PATH]={};
+        HKEY hks;
+        if(RegOpenKeyExW(HKEY_CURRENT_USER,L"Software\\Valve\\Steam",0,KEY_READ,&hks)==ERROR_SUCCESS){
+            DWORD sz=sizeof(steamPath);
+            RegQueryValueExW(hks,L"SteamPath",nullptr,nullptr,(BYTE*)steamPath,&sz);
+            RegCloseKey(hks);
+        }
+        if(steamPath[0]){
+            std::wstring auto_cache=std::wstring(steamPath)+L"\\steamapps\\common\\GarrysMod\\garrysmod\\cache";
+            // Remplacer les / par \ (Steam stocke avec /)
+            std::replace(auto_cache.begin(),auto_cache.end(),L'/',L'\\');
+            DWORD attr=GetFileAttributesW(auto_cache.c_str());
+            if(attr!=INVALID_FILE_ATTRIBUTES&&(attr&FILE_ATTRIBUTE_DIRECTORY)){
+                // Trouvé automatiquement — sauvegarder et skip le setup
+                CACHE_DIR=auto_cache;
+                HKEY hk2;
+                if(RegCreateKeyExW(HKEY_CURRENT_USER,L"Software\\Skybox",0,nullptr,0,KEY_SET_VALUE,nullptr,&hk2,nullptr)==ERROR_SUCCESS){
+                    RegSetValueExW(hk2,L"CacheDir",0,REG_SZ,(BYTE*)auto_cache.c_str(),(DWORD)((auto_cache.size()+1)*sizeof(wchar_t)));
+                    RegCloseKey(hk2);
+                }
+                configured=true;
+            }
+        }
+    }
+    if(!configured){
         WNDCLASSW wcs={};wcs.hInstance=hi;wcs.lpszClassName=L"SKYBOX_SETUP";
         wcs.hbrBackground=(HBRUSH)(COLOR_BTNFACE+1);wcs.hCursor=LoadCursorW(nullptr,IDC_ARROW);
         wcs.lpfnWndProc=SetupWndProc;RegisterClassW(&wcs);
-        HWND hs=CreateWindowW(L"SKYBOX_SETUP",L"Skybox — Configuration",
+        HWND hs=CreateWindowW(L"SKYBOX_SETUP",L"Skyboxc++ — Configuration",
             WS_OVERLAPPED|WS_CAPTION|WS_SYSMENU,CW_USEDEFAULT,CW_USEDEFAULT,480,295,nullptr,nullptr,hi,nullptr);
         ShowWindow(hs,SW_SHOW);UpdateWindow(hs);
         MSG ms;while(GetMessageW(&ms,nullptr,0,0)){TranslateMessage(&ms);DispatchMessageW(&ms);}
@@ -1220,7 +1526,7 @@ int WINAPI wWinMain(HINSTANCE hi,HINSTANCE,LPWSTR,int){
     wc.hCursor=LoadCursorW(nullptr,IDC_ARROW);
     wc.hIcon=LoadIconW(nullptr,IDI_APPLICATION);
     RegisterClassW(&wc);
-    HWND hw=CreateWindowW(L"SI2",L"Skybox",
+    HWND hw=CreateWindowW(L"SI2",L"Skyboxc++",
         WS_OVERLAPPEDWINDOW&~(WS_MAXIMIZEBOX|WS_THICKFRAME),
         CW_USEDEFAULT,CW_USEDEFAULT,665,380,nullptr,nullptr,hi,nullptr);
     ShowWindow(hw,SW_SHOW);UpdateWindow(hw);
